@@ -37,7 +37,7 @@ else
 fi
 
 # --- CONFIGURE SSH ---
-sudo sed -i "s/^#\?PasswordAuthentication.*/PasswordAuthentication no/" /etc/ssh/sshd_config
+sudo sed -i "s/^#\?PasswordAuthentication.*/PasswordAuthentication yes/" /etc/ssh/sshd_config
 sudo sed -i "s/^#\?PubkeyAuthentication.*/PubkeyAuthentication yes/" /etc/ssh/sshd_config
 sudo sed -i "s/^#\?LoginGraceTime.*/LoginGraceTime 20/" /etc/ssh/sshd_config
 sudo sed -i "s/^#\?MaxAuthTries.*/MaxAuthTries 2/" /etc/ssh/sshd_config
@@ -50,7 +50,7 @@ fi
 sudo systemctl restart ssh || sudo systemctl restart sshd
 
 # --- INSTALL ESSENTIAL TOOLS ---
-sudo apt install -y git neovim
+sudo apt install -y neovim
 
 # --- CONFIGURE FIREWALL
 sudo apt install -y ufw
