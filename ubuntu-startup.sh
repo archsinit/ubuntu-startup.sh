@@ -200,8 +200,6 @@ ufw default allow outgoing
 
 # Allow essential services
 ufw allow 22/tcp comment 'SSH'
-ufw allow 80/tcp comment 'HTTP'
-ufw allow 443/tcp comment 'HTTPS'
 
 # Enable firewall
 ufw --force enable
