@@ -1,87 +1,227 @@
-#!/bin/bash
+#!/usr/bin/env bash
 #
-# Ubuntu Server Hardening Interactive Script
-# Version: 0.2.0 | 2025-07-18
-# 
-# This script was developed with AI assistance for comprehensive server hardening
-# on fresh Ubuntu installations. Based on security best practices from various
-# sources including buildplan/du_setup and gtsa/server-setup-linux.
+# Personal Ubuntu Docker Host Bootstrap
+# Version: 1.0.0
 #
-# Changelog:
-# - Added error handling and logging
-# - Improved SSH security configuration
-# - Added input validation
-# - Enhanced firewall configuration
-# - Added system monitoring tools
-# - Improved user feedback and verification
+# Goal:
+# - Fresh Ubuntu server
+# - SSH key-only access
+# - Non-root admin user
+# - Docker Engine installed
+# - No Docker Compose
+# - UFW protects host SSH only
+# - Docker-published ports are treated as intentional public exposure
 #
-# Description:
-# Hardens a fresh Ubuntu server installation with security best practices.
-# Must be run as root on systems with only root user initially configured.
+# Run as root:
+#   bash personal-docker-host-bootstrap.sh
 
 set -euo pipefail
+set +x
+umask 077
 
-# Colors for output
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 NC='\033[0m'
 
-# Logging functions
 log() {
-    echo -e "${GREEN}[$(date +'%Y-%m-%d %H:%M:%S')] $1${NC}"
+  echo -e "${GREEN}[$(date +'%Y-%m-%d %H:%M:%S')] $1${NC}"
 }
 
-error() {
-    echo -e "${RED}[ERROR] $1${NC}" >&2
+warn() {
+  echo -e "${YELLOW}[WARNING] $1${NC}"
 }
 
-warning() {
-    echo -e "${YELLOW}[WARNING] $1${NC}"
+die() {
+  echo -e "${RED}[ERROR] $1${NC}" >&2
+  exit 1
 }
 
-# Check if running as root (required for fresh install)
-if [[ $EUID -ne 0 ]]; then
-   error "This script must be run as root on a fresh installation."
-   error "Please run: sudo bash $0"
-   exit 1
-fi
+require_root() {
+  if [[ "${EUID}" -ne 0 ]]; then
+    die "Run this script as root."
+  fi
+}
 
-log "Starting Ubuntu Server Hardening Script..."
+check_ubuntu() {
+  if [[ ! -r /etc/os-release ]]; then
+    die "Cannot detect OS."
+  fi
 
-# Update and upgrade system packages
-log "Updating and upgrading system packages..."
-apt update && apt upgrade -y
+  . /etc/os-release
 
-log "Installing unattended-upgrades for automatic security updates..."
-apt install -y unattended-upgrades apt-listchanges
-dpkg-reconfigure --priority=low unattended-upgrades
+  if [[ "${ID:-}" != "ubuntu" ]]; then
+    die "This script supports Ubuntu only. Detected: ${ID:-unknown}"
+  fi
 
-# Install essential security and monitoring tools
-log "Installing essential security and monitoring tools..."
-apt install -y \
-    fail2ban \
-    ufw \
-    neovim \
-    htop \
-    curl \
-    wget \
-    git \
-    tree \
-    net-tools \
-    software-properties-common \
-    apt-transport-https \
+  case "${VERSION_ID:-}" in
+    "22.04"|"24.04"|"25.10"|"26.04")
+      log "Detected supported Ubuntu version: ${VERSION_ID}"
+      ;;
+    *)
+      warn "Untested Ubuntu version: ${VERSION_ID:-unknown}"
+      read -r -p "Continue anyway? [y/N]: " CONTINUE
+      [[ "${CONTINUE}" == "y" || "${CONTINUE}" == "Y" ]] || exit 1
+      ;;
+  esac
+}
+
+prompt_username() {
+  while true; do
+    read -r -p "Enter admin username to create/use: " NEW_USER
+
+    if [[ "${NEW_USER}" =~ ^[a-z][-a-z0-9_]*$ ]] && [[ "${#NEW_USER}" -le 32 ]]; then
+      break
+    fi
+
+    echo "Invalid username. Use lowercase letters, numbers, hyphens, underscores. Max 32 chars."
+  done
+}
+
+prompt_ssh_key() {
+  echo
+  echo "Paste your SSH public key."
+  echo "Expected format: ssh-ed25519 AAAA... comment"
+  echo
+
+  while true; do
+    read -r -p "SSH public key: " SSH_PUBLIC_KEY
+
+    if [[ "${SSH_PUBLIC_KEY}" =~ ^ssh-ed25519[[:space:]]+[A-Za-z0-9+/=]+([[:space:]].*)?$ ]] \
+      || [[ "${SSH_PUBLIC_KEY}" =~ ^ecdsa-sha2-nistp[0-9]+[[:space:]]+[A-Za-z0-9+/=]+([[:space:]].*)?$ ]] \
+      || [[ "${SSH_PUBLIC_KEY}" =~ ^ssh-rsa[[:space:]]+[A-Za-z0-9+/=]+([[:space:]].*)?$ ]]; then
+      break
+    fi
+
+    echo "Invalid-looking SSH public key. Paste the full public key line."
+  done
+}
+
+apt_base_setup() {
+  log "Updating packages..."
+  apt-get update
+  DEBIAN_FRONTEND=noninteractive apt-get upgrade -y
+
+  log "Installing base packages..."
+  DEBIAN_FRONTEND=noninteractive apt-get install -y \
     ca-certificates \
+    curl \
     gnupg \
-    lsb-release
+    lsb-release \
+    ufw \
+    fail2ban \
+    unattended-upgrades \
+    apt-listchanges \
+    needrestart \
+    git \
+    wget \
+    htop \
+    neovim
+}
 
-# Configure fail2ban for SSH protection
-log "Configuring fail2ban for SSH protection..."
-systemctl enable fail2ban
-systemctl start fail2ban
+configure_unattended_upgrades() {
+  log "Configuring unattended security upgrades..."
 
-# Create custom fail2ban configuration
-tee /etc/fail2ban/jail.local > /dev/null <<EOF
+  cat >/etc/apt/apt.conf.d/20auto-upgrades <<'EOF'
+APT::Periodic::Update-Package-Lists "1";
+APT::Periodic::Unattended-Upgrade "1";
+APT::Periodic::AutocleanInterval "7";
+EOF
+
+  systemctl enable unattended-upgrades >/dev/null 2>&1 || true
+  systemctl restart unattended-upgrades >/dev/null 2>&1 || true
+}
+
+create_admin_user() {
+  if id "${NEW_USER}" >/dev/null 2>&1; then
+    warn "User ${NEW_USER} already exists. Reusing."
+  else
+    log "Creating user ${NEW_USER}..."
+    adduser --gecos "" "${NEW_USER}"
+  fi
+
+  usermod -aG sudo "${NEW_USER}"
+}
+
+install_ssh_key() {
+  log "Installing SSH key for ${NEW_USER}..."
+
+  local USER_HOME
+  USER_HOME="$(getent passwd "${NEW_USER}" | cut -d: -f6)"
+
+  [[ -n "${USER_HOME}" ]] || die "Could not determine home directory for ${NEW_USER}."
+
+  install -d -m 700 -o "${NEW_USER}" -g "${NEW_USER}" "${USER_HOME}/.ssh"
+
+  touch "${USER_HOME}/.ssh/authorized_keys"
+  chown "${NEW_USER}:${NEW_USER}" "${USER_HOME}/.ssh/authorized_keys"
+  chmod 600 "${USER_HOME}/.ssh/authorized_keys"
+
+  if ! grep -qxF "${SSH_PUBLIC_KEY}" "${USER_HOME}/.ssh/authorized_keys"; then
+    echo "${SSH_PUBLIC_KEY}" >>"${USER_HOME}/.ssh/authorized_keys"
+  fi
+}
+
+harden_ssh() {
+  log "Hardening SSH..."
+
+  local BACKUP
+  BACKUP="/etc/ssh/sshd_config.backup.$(date +%Y%m%d_%H%M%S)"
+  cp /etc/ssh/sshd_config "${BACKUP}"
+
+  install -d -m 755 /etc/ssh/sshd_config.d
+
+  cat >/etc/ssh/sshd_config.d/99-personal-hardening.conf <<EOF
+# Managed by personal Docker host bootstrap
+
+PubkeyAuthentication yes
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+PermitRootLogin no
+PermitEmptyPasswords no
+
+LoginGraceTime 20
+MaxAuthTries 3
+MaxSessions 5
+
+AllowUsers ${NEW_USER}
+
+X11Forwarding no
+PermitUserEnvironment no
+ClientAliveInterval 300
+ClientAliveCountMax 2
+UseDNS no
+EOF
+
+  if sshd -t; then
+    systemctl reload ssh >/dev/null 2>&1 || systemctl reload sshd >/dev/null 2>&1 || {
+      cp "${BACKUP}" /etc/ssh/sshd_config
+      rm -f /etc/ssh/sshd_config.d/99-personal-hardening.conf
+      die "Failed to reload SSH. Restored main sshd_config backup."
+    }
+  else
+    cp "${BACKUP}" /etc/ssh/sshd_config
+    rm -f /etc/ssh/sshd_config.d/99-personal-hardening.conf
+    die "Invalid SSH config. Restored backup."
+  fi
+}
+
+configure_ufw() {
+  log "Configuring UFW host firewall..."
+
+  ufw --force reset
+  ufw default deny incoming
+  ufw default allow outgoing
+
+  ufw allow 22/tcp comment 'SSH host access'
+
+  ufw --force enable
+}
+
+configure_fail2ban() {
+  log "Configuring fail2ban..."
+
+  cat >/etc/fail2ban/jail.local <<'EOF'
 [DEFAULT]
 bantime = 3600
 findtime = 600
@@ -92,271 +232,305 @@ backend = systemd
 enabled = true
 port = ssh
 filter = sshd
-logpath = /var/log/auth.log
-maxretry = 2
+maxretry = 3
 bantime = 7200
 EOF
 
-systemctl restart fail2ban
+  systemctl enable fail2ban
+  systemctl restart fail2ban
+}
 
-# Install Docker and Docker Compose
-log "Installing Docker..."
-if ! command -v docker &> /dev/null; then
-    curl -fsSL https://get.docker.com -o get-docker.sh
-    sh get-docker.sh
-    rm get-docker.sh
-    
-    # Install Docker Compose
-    log "Installing Docker Compose..."
-    curl -L "https://github.com/docker/compose/releases/latest/download/docker-compose-$(uname -s)-$(uname -m)" -o /usr/local/bin/docker-compose
-    chmod +x /usr/local/bin/docker-compose
-    
-    # Create docker-compose symlink for convenience
-    ln -sf /usr/local/bin/docker-compose /usr/bin/docker-compose
-else
-    log "Docker is already installed."
-fi
+install_docker() {
+  log "Installing Docker Engine without Docker Compose..."
 
-# Create non-root user
-while true; do
-    read -p "Enter the username for the new user: " NEW_USER
-    
-    # Validate username
-    if [[ "$NEW_USER" =~ ^[a-z][-a-z0-9_]*$ ]] && [[ ${#NEW_USER} -le 32 ]]; then
-        break
-    else
-        error "Invalid username. Use lowercase letters, numbers, hyphens, and underscores only (max 32 chars)."
-    fi
-done
+  for pkg in docker.io docker-doc docker-compose docker-compose-v2 podman-docker containerd runc; do
+    apt-get remove -y "${pkg}" >/dev/null 2>&1 || true
+  done
 
-if id "$NEW_USER" &>/dev/null; then
-    warning "User $NEW_USER already exists. Skipping creation."
-else
-    log "Creating user $NEW_USER..."
-    adduser --gecos "" $NEW_USER
-    usermod -aG sudo $NEW_USER
-    
-    # Add to docker group if it exists
-    if getent group docker > /dev/null 2>&1; then
-        usermod -aG docker $NEW_USER
-        log "Added $NEW_USER to docker group."
-    else
-        warning "Docker group does not exist. Skipping docker group assignment."
-    fi
-fi
+  install -m 0755 -d /etc/apt/keyrings
 
-# Configure SSH hardening
-log "Configuring SSH for enhanced security..."
+  curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
+  chmod a+r /etc/apt/keyrings/docker.asc
 
-# Backup original SSH config
-cp /etc/ssh/sshd_config /etc/ssh/sshd_config.backup.$(date +%Y%m%d_%H%M%S)
+  . /etc/os-release
 
-# Apply SSH hardening configurations
-sed -i "s/^#\?PasswordAuthentication.*/PasswordAuthentication no/" /etc/ssh/sshd_config
-sed -i "s/^#\?PubkeyAuthentication.*/PubkeyAuthentication yes/" /etc/ssh/sshd_config
-sed -i "s/^#\?LoginGraceTime.*/LoginGraceTime 20/" /etc/ssh/sshd_config
-sed -i "s/^#\?MaxAuthTries.*/MaxAuthTries 2/" /etc/ssh/sshd_config
-sed -i "s/^#\?MaxSessions.*/MaxSessions 5/" /etc/ssh/sshd_config
-sed -i "s/^#\?PermitRootLogin.*/PermitRootLogin no/" /etc/ssh/sshd_config
-sed -i "s/^#\?PermitEmptyPasswords.*/PermitEmptyPasswords no/" /etc/ssh/sshd_config
-sed -i "s/^#\?Protocol.*/Protocol 2/" /etc/ssh/sshd_config
-sed -i "s/^#\?X11Forwarding.*/X11Forwarding no/" /etc/ssh/sshd_config
-
-# Remove any existing AllowUsers lines and add new one
-sed -i "/^AllowUsers/d" /etc/ssh/sshd_config
-echo "AllowUsers $NEW_USER" | tee -a /etc/ssh/sshd_config > /dev/null
-
-# Add additional security settings
-cat << 'EOF' | tee -a /etc/ssh/sshd_config > /dev/null
-
-# Additional security settings
-ClientAliveInterval 300
-ClientAliveCountMax 2
-UseDNS no
-PermitUserEnvironment no
-Compression no
-TCPKeepAlive no
-AllowAgentForwarding no
-AllowTcpForwarding no
-GatewayPorts no
-PermitTunnel no
+  cat >/etc/apt/sources.list.d/docker.sources <<EOF
+Types: deb
+URIs: https://download.docker.com/linux/ubuntu
+Suites: ${UBUNTU_CODENAME:-$VERSION_CODENAME}
+Components: stable
+Architectures: $(dpkg --print-architecture)
+Signed-By: /etc/apt/keyrings/docker.asc
 EOF
 
-# Test SSH configuration
-if sshd -t; then
-    log "SSH configuration is valid. Restarting SSH service..."
-    systemctl restart ssh 2>/dev/null || systemctl restart sshd 2>/dev/null
-else
-    error "SSH configuration is invalid. Restoring backup..."
-    cp /etc/ssh/sshd_config.backup.* /etc/ssh/sshd_config
-    exit 1
-fi
+  apt-get update
 
-# Configure UFW firewall
-log "Configuring UFW firewall..."
-ufw --force reset
-ufw default deny incoming
-ufw default allow outgoing
+  DEBIAN_FRONTEND=noninteractive apt-get install -y \
+    docker-ce \
+    docker-ce-cli \
+    containerd.io \
+    docker-buildx-plugin
 
-# Allow essential services
-ufw allow 22/tcp comment 'SSH'
+  systemctl enable docker
+  systemctl start docker
 
-# Enable firewall
-ufw --force enable
+  usermod -aG docker "${NEW_USER}"
 
-# Secure shared memory (prevents execution of code from shared memory)
-# This prevents malicious programs from accessing shared memory segments
-# that could contain sensitive data from other processes
-log "Securing shared memory..."
-if ! grep -q "tmpfs /run/shm" /etc/fstab; then
-    echo 'tmpfs /run/shm tmpfs defaults,noexec,nosuid 0 0' | tee -a /etc/fstab > /dev/null
-    log "Added secure shared memory mount to /etc/fstab"
-fi
+  warn "User ${NEW_USER} is now in the docker group."
+  warn "Docker group membership is effectively root-level access."
+}
 
-# Disable unnecessary services that could be attack vectors
-# These services are often not needed on servers
-log "Checking for unnecessary services to disable..."
-services_to_disable=("avahi-daemon" "cups" "isc-dhcp-server" "isc-dhcp-server6" "rpcbind" "nfs-server")
-for service in "${services_to_disable[@]}"; do
-    if systemctl is-enabled "$service" &>/dev/null; then
-        systemctl disable "$service" && log "Disabled $service"
-    fi
-done
+configure_docker_daemon() {
+  log "Configuring Docker daemon defaults..."
 
-# Apply kernel security parameters to harden network stack
-# These settings protect against various network-based attacks
-log "Applying kernel security parameters..."
-tee /etc/sysctl.d/99-security.conf > /dev/null <<EOF
-# IP Spoofing protection - prevents attackers from pretending to be other IPs
+  install -d -m 755 /etc/docker
+
+  cat >/etc/docker/daemon.json <<'EOF'
+{
+  "log-driver": "json-file",
+  "log-opts": {
+    "max-size": "10m",
+    "max-file": "3"
+  },
+  "live-restore": true
+}
+EOF
+
+  systemctl restart docker
+}
+
+create_service_layout() {
+  log "Creating service directory layout..."
+
+  install -d -m 750 -o root -g docker /opt/services
+  install -d -m 750 -o root -g docker /opt/services/_scripts
+  install -d -m 750 -o root -g docker /opt/services/_env
+  install -d -m 750 -o root -g docker /opt/services/_secrets
+  install -d -m 750 -o root -g docker /opt/services/_volumes
+
+  cat >/opt/services/README.txt <<'EOF'
+Personal Docker service layout
+
+/scripts:
+  Put docker run scripts here.
+  Recommended script header:
+    set -euo pipefail
+    set +x
+    umask 077
+
+_env:
+  Non-secret environment files.
+  Suggested permissions: 640
+
+_secrets:
+  Secret files mounted read-only into containers.
+  Suggested permissions: 600
+
+_volumes:
+  Bind-mounted app data.
+  Back this directory up.
+
+Important Docker exposure rule:
+  -p 80:80 exposes publicly on all interfaces.
+  -p 127.0.0.1:8080:8080 exposes locally only.
+  No -p means no host port exposure.
+EOF
+
+  chown root:docker /opt/services/README.txt
+  chmod 640 /opt/services/README.txt
+}
+
+create_proxy_network() {
+  log "Creating Docker network: proxy"
+
+  if docker network inspect proxy >/dev/null 2>&1; then
+    log "Docker network proxy already exists."
+  else
+    docker network create proxy >/dev/null
+  fi
+}
+
+apply_basic_sysctl() {
+  log "Applying modest sysctl hardening..."
+
+  cat >/etc/sysctl.d/99-personal-server.conf <<'EOF'
+# Managed by personal Docker host bootstrap
+
+# Spoofing protection
 net.ipv4.conf.default.rp_filter = 1
 net.ipv4.conf.all.rp_filter = 1
 
-# Ignore ICMP redirects - prevents network redirection attacks
+# Redirect hardening
 net.ipv4.conf.all.accept_redirects = 0
 net.ipv6.conf.all.accept_redirects = 0
 net.ipv4.conf.default.accept_redirects = 0
 net.ipv6.conf.default.accept_redirects = 0
-
-# Ignore send redirects - prevents this server from being used in redirection attacks
 net.ipv4.conf.all.send_redirects = 0
 net.ipv4.conf.default.send_redirects = 0
 
-# Disable source packet routing - prevents routing manipulation attacks
+# Source routing hardening
 net.ipv4.conf.all.accept_source_route = 0
 net.ipv6.conf.all.accept_source_route = 0
 net.ipv4.conf.default.accept_source_route = 0
 net.ipv6.conf.default.accept_source_route = 0
 
-# Log suspicious packets (Martians) - helps detect network attacks
+# Suspicious packet logging
 net.ipv4.conf.all.log_martians = 1
 net.ipv4.conf.default.log_martians = 1
 
-# Ignore ICMP ping requests - makes server less discoverable
-net.ipv4.icmp_echo_ignore_all = 1
-
-# Ignore broadcast pings - prevents participation in smurf attacks
-net.ipv4.icmp_echo_ignore_broadcasts = 1
-
-# Disable IPv6 if not needed - reduces attack surface
-net.ipv6.conf.all.disable_ipv6 = 1
-net.ipv6.conf.default.disable_ipv6 = 1
-net.ipv6.conf.lo.disable_ipv6 = 1
-
-# Enable TCP SYN cookies - helps prevent SYN flood attacks
+# SYN flood protection
 net.ipv4.tcp_syncookies = 1
 
-# Increase system security - enables additional protections
+# Kernel info restrictions
 kernel.randomize_va_space = 2
+kernel.kptr_restrict = 2
+kernel.dmesg_restrict = 1
+kernel.yama.ptrace_scope = 1
+
+# Filesystem link protections
+fs.protected_hardlinks = 1
+fs.protected_symlinks = 1
+fs.suid_dumpable = 0
 EOF
 
-sysctl -p /etc/sysctl.d/99-security.conf
+  sysctl --system >/dev/null
+}
 
-# Verification and summary
-echo
-echo "=================================================="
-echo "UBUNTU SERVER HARDENING COMPLETED"
-echo "=================================================="
-echo
-echo "Verification Summary:"
-echo "--------------------"
+write_report() {
+  local REPORT="/root/hardening-report-$(date +%Y%m%d-%H%M%S).txt"
 
-# Docker verification
-if command -v docker &> /dev/null; then
-    echo "Docker version: $(docker --version)"
-fi
+  {
+    echo "Personal Docker Host Bootstrap Report"
+    echo "Generated: $(date)"
+    echo
+    echo "User:"
+    echo "  Admin user: ${NEW_USER}"
+    echo "  Groups: $(groups "${NEW_USER}")"
+    echo
+    echo "SSH:"
+    sshd -T 2>/dev/null | grep -E '^(passwordauthentication|kbdinteractiveauthentication|permitrootlogin|pubkeyauthentication|allowusers)' || true
+    echo
+    echo "UFW:"
+    ufw status verbose || true
+    echo
+    echo "Fail2ban:"
+    systemctl is-active fail2ban || true
+    fail2ban-client status sshd 2>/dev/null || true
+    echo
+    echo "Docker:"
+    docker --version 2>/dev/null || true
+    docker buildx version 2>/dev/null || true
+    echo
+    echo "Docker networks:"
+    docker network ls 2>/dev/null || true
+    echo
+    echo "Published Docker ports:"
+    docker ps --format 'table {{.Names}}\t{{.Ports}}' 2>/dev/null || true
+    echo
+    echo "Listening host ports:"
+    ss -tulpen 2>/dev/null || true
+    echo
+    echo "Reboot required:"
+    if [[ -f /var/run/reboot-required ]]; then
+      echo "  yes"
+      cat /var/run/reboot-required.pkgs 2>/dev/null || true
+    else
+      echo "  no"
+    fi
+    echo
+    echo "Important notes:"
+    echo "  UFW allows SSH only."
+    echo "  Docker-published ports may be reachable regardless of normal UFW expectations."
+    echo "  Treat every docker run -p 0.0.0.0:HOST:CONTAINER or -p HOST:CONTAINER as public."
+    echo "  Use -p 127.0.0.1:HOST:CONTAINER for local-only services."
+    echo "  Do not put secrets directly in docker run arguments."
+    echo "  Prefer --env-file for config and mounted files for secrets."
+    echo "  Back up /opt/services, especially /opt/services/_volumes and /opt/services/_secrets."
+  } >"${REPORT}"
 
-if command -v docker-compose &> /dev/null; then
-    echo "Docker Compose version: $(docker-compose --version)"
-fi
+  chmod 600 "${REPORT}"
 
-# SSH service verification
-echo "SSH service status:"
-if systemctl is-active --quiet ssh || systemctl is-active --quiet sshd; then
-    echo "   SSH service is running"
-else
-    echo "   SSH service is not running"
-fi
+  log "Report written to ${REPORT}"
+}
 
-# Firewall verification
-echo "UFW status:"
-ufw status | head -n 10
+print_final_notes() {
+  echo
+  echo "============================================================"
+  echo "BOOTSTRAP COMPLETE"
+  echo "============================================================"
+  echo
+  echo "Admin user:"
+  echo "  ${NEW_USER}"
+  echo
+  echo "SSH:"
+  echo "  Root login disabled"
+  echo "  Password login disabled"
+  echo "  Key login enabled for ${NEW_USER}"
+  echo
+  echo "Firewall:"
+  echo "  UFW allows host SSH only: 22/tcp"
+  echo "  No HTTP/HTTPS UFW rules were added"
+  echo
+  echo "Docker:"
+  echo "  Docker Engine installed"
+  echo "  Docker Compose intentionally not installed"
+  echo "  Docker log rotation enabled"
+  echo "  Docker network created: proxy"
+  echo
+  echo "Service layout:"
+  echo "  /opt/services/_scripts"
+  echo "  /opt/services/_env"
+  echo "  /opt/services/_secrets"
+  echo "  /opt/services/_volumes"
+  echo
+  echo "Important:"
+  echo "  Docker-published ports are intentional exposure."
+  echo "  Example public port:"
+  echo "    docker run -p 80:80 ..."
+  echo
+  echo "  Example local-only port:"
+  echo "    docker run -p 127.0.0.1:8080:8080 ..."
+  echo
+  echo "  Avoid secrets in command arguments."
+  echo "  Prefer --env-file and mounted secret files."
+  echo
+  echo "Before closing this root session:"
+  echo "  Open a second terminal and test:"
+  echo "    ssh ${NEW_USER}@SERVER_IP"
+  echo
+  if [[ -f /var/run/reboot-required ]]; then
+    echo "Reboot required: yes"
+  else
+    echo "Reboot required: no"
+  fi
+  echo
+  echo "============================================================"
+}
 
-# Fail2ban verification
-echo "Fail2ban status:"
-if systemctl is-active --quiet fail2ban; then
-    echo "   Fail2ban is running"
-    fail2ban-client status sshd | head -n 5
-else
-    echo "   Fail2ban is not running"
-fi
+main() {
+  require_root
+  check_ubuntu
+  prompt_username
+  prompt_ssh_key
 
-# User verification
-echo "User $NEW_USER groups: $(groups $NEW_USER)"
+  apt_base_setup
+  configure_unattended_upgrades
 
-echo
-echo "=================================================="
-echo "SSH KEY-BASED AUTHENTICATION SETUP"
-echo "=================================================="
-echo
-echo "IMPORTANT: Password authentication is now DISABLED!"
-echo "You MUST set up SSH key authentication before logging out."
-echo
-echo "Instructions:"
-echo "1. On your LOCAL machine, generate an SSH key pair if you don't have one:"
-echo "   ssh-keygen -t ed25519 -C \"your_email@example.com\""
-echo
-echo "2. Display your public key on your local machine:"
-echo "   cat ~/.ssh/id_ed25519.pub"
-echo
-echo "3. Copy the ENTIRE output from step 2."
-echo
-echo "4. On THIS SERVER, while still logged in as root, run:"
-echo "   mkdir -p /home/$NEW_USER/.ssh"
-echo "   chmod 700 /home/$NEW_USER/.ssh"
-echo "   nano /home/$NEW_USER/.ssh/authorized_keys"
-echo
-echo "5. Paste your public key into the file and save (Ctrl+X, Y, Enter)."
-echo
-echo "6. Set proper permissions:"
-echo "   chmod 600 /home/$NEW_USER/.ssh/authorized_keys"
-echo "   chown -R $NEW_USER:$NEW_USER /home/$NEW_USER/.ssh"
-echo
-echo "7. Test SSH connection from your local machine:"
-echo "   ssh $NEW_USER@$(hostname -I | awk '{print $1}')"
-echo
-echo "8. Only after confirming SSH key login works, you can logout safely."
-echo
-echo "=================================================="
-echo "ADDITIONAL SECURITY RECOMMENDATIONS"
-echo "=================================================="
-echo "- Regularly update your system: apt update && apt upgrade"
-echo "- Monitor logs: journalctl -f"
-echo "- Check fail2ban status: fail2ban-client status"
-echo "- Review UFW rules: ufw status verbose"
-echo "- Consider setting up automated backups"
-echo "- Enable 2FA where possible"
-echo "- Use strong, unique passwords"
-echo "- Regularly audit user accounts and permissions"
-echo
-echo "Server hardening complete."
-echo "=================================================="
+  create_admin_user
+  install_ssh_key
+  harden_ssh
+
+  configure_ufw
+  configure_fail2ban
+
+  install_docker
+  configure_docker_daemon
+  create_service_layout
+  create_proxy_network
+
+  apply_basic_sysctl
+  write_report
+  print_final_notes
+}
+
+main "$@"
